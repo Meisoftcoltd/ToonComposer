@@ -1,0 +1,9 @@
+openai
+faster-whisper
+llama-cpp-python
+diffusers
+kokoro-onnx
+soundfile
+moviepy
+Pillow
+numpy

@@ -1,0 +1,595 @@
+import os
+import torch
+import json
+import uuid
+import nodes
+import folder_paths
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from .utils import get_temp_dir, cleanup_vram, parse_json_output, make_grid
+
+# Lazy imports
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
+class OracleBrainAPI:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "narrative_text": ("STRING", {"multiline": True, "default": "A cyberpunk detective walking through a rainy neon city."}),
+                "available_voices": ("STRING", {"default": "Bella, Sarul, QwenUser"}),
+                "model_name": ("STRING", {"default": "gpt-4-turbo"}),
+                "base_url": ("STRING", {"default": "https://api.openai.com/v1"}),
+                "api_key": ("STRING", {"default": "sk-..."}),
+            },
+            "optional": {
+                "audio_path": ("STRING", {"default": ""}),
+                "system_prompt": ("STRING", {"multiline": True, "default": "You are a Director. Output a strict JSON list."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("storyboard_json",)
+    FUNCTION = "generate_storyboard"
+    CATEGORY = "🪬 OracleMotion"
+
+    def generate_storyboard(self, narrative_text, available_voices, model_name, base_url, api_key, audio_path="", system_prompt=""):
+        text_input = narrative_text
+
+        # 1. Audio Transcription
+        if audio_path and os.path.exists(audio_path):
+            if WhisperModel is None:
+                print("Warning: faster_whisper not found. Skipping transcription.")
+            else:
+                try:
+                    print(f"Transcribing {audio_path}...")
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    model = WhisperModel("base", device=device, compute_type="float16" if device=="cuda" else "int8")
+                    segments, _ = model.transcribe(audio_path)
+                    transcribed_text = " ".join([segment.text for segment in segments])
+                    text_input += "\n\nAudio Transcript: " + transcribed_text
+                except Exception as e:
+                    print(f"Transcription Error: {e}")
+
+        # 2. LLM Generation
+        if OpenAI is None:
+            raise ImportError("openai library required.")
+
+        client = OpenAI(api_key=api_key, base_url=base_url)
+
+        FULL_SYSTEM_PROMPT = f"""
+{system_prompt}
+Your task is to convert the user's narrative into a structured visual storyboard.
+Available Voice Actors: {available_voices}
+
+RULES:
+1. Output MUST be a valid JSON list of objects.
+2. Each object represents a scene.
+3. Keys required per object:
+   - "scene_id": (int) sequential index.
+   - "dialogue": (string) Text to be spoken (empty if silent).
+   - "audio_emotion": (string) Adjective (e.g., Happy, Sad, Whispering).
+   - "voice_name": (string) Name of the voice actor.
+   - "visual_prompt": (string) SDXL Prompt.
+   - "action_description": (string) Movement description.
+"""
+
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": FULL_SYSTEM_PROMPT},
+                    {"role": "user", "content": text_input}
+                ]
+            )
+            content = response.choices[0].message.content
+            parsed_json = parse_json_output(content)
+        except Exception as e:
+            print(f"LLM Error: {e}")
+            parsed_json = []
+
+        return (json.dumps(parsed_json, indent=2),)
+
+class OracleBrainLocal:
+    @classmethod
+    def INPUT_TYPES(s):
+        from .utils import get_llm_models
+        models = get_llm_models()
+        return {
+            "required": {
+                "llm_model": (models if models else ["No models found"],),
+                "narrative_text": ("STRING", {"multiline": True, "default": "A cyberpunk detective walking through a rainy neon city."}),
+                "available_voices": ("STRING", {"default": "Bella, Sarul, QwenUser"}),
+                "context_window": ("INT", {"default": 8192}),
+                "max_tokens": ("INT", {"default": 2048}),
+                "gpu_layers": ("INT", {"default": 33}),
+                "temperature": ("FLOAT", {"default": 0.7}),
+            },
+            "optional": {
+                "system_prompt": ("STRING", {"multiline": True, "default": "You are a Director. Output a strict JSON list."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("storyboard_json",)
+    FUNCTION = "generate_storyboard_local"
+    CATEGORY = "🪬 OracleMotion"
+
+    def generate_storyboard_local(self, llm_model, narrative_text, available_voices, context_window, max_tokens, gpu_layers, temperature, system_prompt=""):
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise ImportError("llama-cpp-python is required.")
+
+        # Locate Model
+        model_path = folder_paths.get_full_path("LLM", llm_model)
+        if not model_path:
+             # Fallback manual check
+             base_path = os.path.join(folder_paths.models_dir, "LLM")
+             model_path = os.path.join(base_path, llm_model)
+
+        if not os.path.exists(model_path):
+            raise RuntimeError(f"Model not found: {model_path}")
+
+        print(f"Loading Local LLM: {model_path}")
+        llm = Llama(
+            model_path=model_path,
+            n_ctx=context_window,
+            n_gpu_layers=gpu_layers,
+            verbose=False
+        )
+
+        FULL_SYSTEM_PROMPT = f"""
+{system_prompt}
+Convert narrative to JSON storyboard.
+Available Voices: {available_voices}
+Required Keys: scene_id, dialogue, audio_emotion, voice_name, visual_prompt, action_description.
+Output ONLY JSON.
+"""
+
+        # Simple Prompt Template
+        prompt = f"System: {FULL_SYSTEM_PROMPT}\nUser: {narrative_text}\nAssistant:"
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": FULL_SYSTEM_PROMPT},
+                    {"role": "user", "content": narrative_text}
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={"type": "json_object"}
+            )
+            content = response["choices"][0]["message"]["content"]
+        except:
+            # Fallback
+            response = llm(prompt, max_tokens=max_tokens, temperature=temperature)
+            content = response["choices"][0]["text"]
+
+        parsed_json = parse_json_output(content)
+        del llm
+        cleanup_vram()
+        return (json.dumps(parsed_json, indent=2),)
+
+class OracleDirector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": { "storyboard_json": ("STRING", {"forceInput": True}) },
+            "hidden": { "user_edits": ("STRING", {"default": "[]"}) }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("finalized_json",)
+    FUNCTION = "direct_scenes"
+    CATEGORY = "🪬 OracleMotion"
+
+    def direct_scenes(self, storyboard_json, user_edits="[]"):
+        try: ai_scenes = json.loads(storyboard_json)
+        except: ai_scenes = []
+        try: user_scenes = json.loads(user_edits)
+        except: user_scenes = []
+
+        final_scenes = user_scenes if user_scenes else ai_scenes
+
+        # Validation & Normalization
+        validated = []
+        for i, s in enumerate(final_scenes):
+            validated.append({
+                "scene_id": s.get("scene_id", i),
+                "dialogue": s.get("dialogue", ""),
+                "audio_emotion": s.get("audio_emotion", ""),
+                "voice_name": s.get("voice_name", ""),
+                "visual_prompt": s.get("visual_prompt", s.get("prompt", "")),
+                "action_description": s.get("action_description", s.get("action", "")),
+                "reference_path": s.get("reference_path", ""),
+                "duration": s.get("duration", 3.0), # Important for Engine
+                "audio_path": s.get("audio_path", "")
+            })
+
+        return (json.dumps(validated, indent=2),)
+
+class OracleVisualizer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "storyboard_json": ("STRING", {"forceInput": True}),
+                "sdxl_ckpt": ("STRING", {"default": "stabilityai/stable-diffusion-xl-base-1.0"}),
+                "global_style_prompt": ("STRING", {"multiline": True, "default": "Cinematic lighting, 8k"}),
+            },
+            "optional": {
+                "base_character_image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("LIST", "IMAGE")
+    RETURN_NAMES = ("keyframe_paths", "preview_image")
+    FUNCTION = "generate_keyframes"
+    CATEGORY = "🪬 OracleMotion"
+
+    def generate_keyframes(self, storyboard_json, sdxl_ckpt, global_style_prompt, base_character_image=None):
+        from diffusers import StableDiffusionXLPipeline
+
+        scenes = json.loads(storyboard_json)
+        temp_dir = get_temp_dir()
+        keyframe_paths = []
+
+        print(f"Loading SDXL: {sdxl_ckpt}")
+        if os.path.isfile(sdxl_ckpt):
+            pipe = StableDiffusionXLPipeline.from_single_file(sdxl_ckpt, torch_dtype=torch.float16, use_safetensors=True)
+        else:
+            pipe = StableDiffusionXLPipeline.from_pretrained(sdxl_ckpt, torch_dtype=torch.float16)
+
+        pipe.enable_model_cpu_offload()
+
+        for i, scene in enumerate(scenes):
+            prompt = f"{scene.get('visual_prompt', '')}, {scene.get('audio_emotion', '')} expression, {global_style_prompt}"
+
+            # TODO: Img2Img support if base_character_image is provided could be added here
+            # For now, Text2Img
+            image = pipe(prompt=prompt, width=1024, height=1024).images[0]
+
+            filename = f"keyframe_{i}_{uuid.uuid4().hex[:6]}.png"
+            filepath = os.path.join(temp_dir, filename)
+            image.save(filepath)
+            keyframe_paths.append(filepath)
+
+        del pipe
+        cleanup_vram()
+        return (keyframe_paths, make_grid(keyframe_paths))
+
+class OracleEngine:
+    @classmethod
+    def INPUT_TYPES(s):
+        try:
+            import comfy.samplers
+            samplers = comfy.samplers.KSampler.SAMPLERS
+            schedulers = comfy.samplers.KSampler.SCHEDULERS
+        except:
+            samplers = ["euler"]
+            schedulers = ["normal"]
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "vae": ("VAE",),
+                "clip": ("CLIP",),
+                "keyframe_paths": ("LIST",),
+                "storyboard_json": ("STRING", {"forceInput": True}),
+                "fps": ("INT", {"default": 16}),
+                "steps": ("INT", {"default": 20}),
+                "cfg": ("FLOAT", {"default": 6.0}),
+                "sampler_name": (samplers,),
+                "scheduler": (schedulers,),
+                "denoise": ("FLOAT", {"default": 1.0}),
+                "motion_strength": ("FLOAT", {"default": 1.0}),
+            },
+            "optional": {
+                "positive": ("STRING", {"default": "high quality motion", "multiline": True}),
+                "negative": ("STRING", {"default": "static, watermark", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("LIST",)
+    RETURN_NAMES = ("video_paths",)
+    FUNCTION = "animate_scenes"
+    CATEGORY = "🪬 OracleMotion"
+
+    def animate_scenes(self, model, vae, clip, keyframe_paths, storyboard_json, fps, steps, cfg, sampler_name, scheduler, denoise, motion_strength, positive, negative):
+        from diffusers.utils import export_to_video
+        scenes = json.loads(storyboard_json)
+        temp_dir = get_temp_dir()
+        video_paths = []
+
+        # Conditioning
+        tokens = clip.tokenize(positive)
+        cond_pos = [[clip.encode_from_tokens(tokens, return_pooled=True)[0], {"pooled_output": clip.encode_from_tokens(tokens, return_pooled=True)[1]}]]
+        tokens_neg = clip.tokenize(negative)
+        cond_neg = [[clip.encode_from_tokens(tokens_neg, return_pooled=True)[0], {"pooled_output": clip.encode_from_tokens(tokens_neg, return_pooled=True)[1]}]]
+
+        last_latent = None
+
+        for i, path in enumerate(keyframe_paths):
+            duration = scenes[i].get("duration", 4.0) if i < len(scenes) else 4.0
+            num_frames = max(16, int(duration * fps))
+
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            w, h = (w // 8) * 8, (h // 8) * 8
+            img = img.resize((w, h))
+            img_tensor = torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+
+            # Encode VAE Safe
+            try:
+                latent = vae.encode(img_tensor[:,:,:,:3]) # [1, 4, H/8, W/8]
+            except:
+                latent = vae.encode(img_tensor)
+
+            # Expand for Video
+            lat_sample = latent["samples"]
+            lat_batch = lat_sample.repeat(num_frames, 1, 1, 1)
+
+            # Sample
+            seed = torch.randint(0, 2**32 - 1, (1,)).item()
+            samples = nodes.common_ksampler(
+                model, seed, steps, cfg, sampler_name, scheduler,
+                cond_pos, cond_neg, {"samples": lat_batch}, denoise=denoise
+            )[0]["samples"]
+
+            # Decode
+            pixels = vae.decode(samples) # [F, H, W, 3]
+
+            # Save
+            frames = []
+            for f in range(pixels.shape[0]):
+                p = (pixels[f].cpu().numpy() * 255).astype(np.uint8)
+                frames.append(Image.fromarray(p))
+
+            out_name = f"scene_{i}_{uuid.uuid4().hex[:6]}.mp4"
+            out_path = os.path.join(temp_dir, out_name)
+            export_to_video(frames, out_path, fps=fps)
+            video_paths.append(out_path)
+
+            cleanup_vram()
+
+        return (video_paths,)
+
+class OracleVoiceKokoro:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "storyboard_json": ("STRING", {"forceInput": True}) } }
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("enhanced_json",)
+    FUNCTION = "gen_voice"
+    CATEGORY = "🪬 OracleMotion"
+
+    def gen_voice(self, storyboard_json):
+        try:
+             import soundfile as sf
+             from kokoro_onnx import Kokoro
+        except ImportError:
+             raise ImportError("Missing requirements: soundfile, kokoro-onnx")
+
+        scenes = json.loads(storyboard_json)
+        temp_dir = get_temp_dir()
+
+        # Path logic
+        base_kokoro = os.path.join(folder_paths.models_dir, "Kokoro")
+        model_path = os.path.join(base_kokoro, "kokoro-v0_19.onnx")
+        voices_path = os.path.join(base_kokoro, "voices.json")
+
+        if not os.path.exists(model_path):
+             print(f"Kokoro not found at {model_path}. Please download it.")
+             return (storyboard_json,)
+
+        kokoro = Kokoro(model_path, voices_path)
+
+        for scene in scenes:
+            text = scene.get("dialogue", "")
+            if text:
+                voice = scene.get("voice_name", "af_bella")
+                try:
+                    samples, sample_rate = kokoro.create(text, voice=voice, speed=1.0)
+                    duration = len(samples) / sample_rate
+
+                    fname = f"audio_{scene['scene_id']}_{uuid.uuid4().hex[:6]}.wav"
+                    fpath = os.path.join(temp_dir, fname)
+                    sf.write(fpath, samples, sample_rate)
+
+                    scene["audio_path"] = fpath
+                    scene["duration"] = duration + 0.5 # Padding
+                except Exception as e:
+                    print(f"Voice Gen Error: {e}")
+                    scene["duration"] = 4.0
+            else:
+                scene["duration"] = 4.0
+
+        return (json.dumps(scenes, indent=2),)
+
+class OracleVoiceInjector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "storyboard_json": ("STRING", {"forceInput": True}),
+                "audio_batch": ("AUDIO",),
+            }
+        }
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("enhanced_json",)
+    FUNCTION = "inject"
+    CATEGORY = "🪬 OracleMotion"
+
+    def inject(self, storyboard_json, audio_batch):
+        scenes = json.loads(storyboard_json)
+        temp_dir = get_temp_dir()
+
+        # ComfyUI Audio: {"waveform": [Batch, Channels, Samples], "sample_rate": int}
+        waveforms = audio_batch["waveform"]
+        sr = audio_batch["sample_rate"]
+
+        import soundfile as sf
+
+        for i, scene in enumerate(scenes):
+            if i < waveforms.shape[0]:
+                clip = waveforms[i]
+                # Robust Mono/Stereo
+                if clip.dim() == 1:
+                    clip = clip.unsqueeze(0)
+
+                audio_np = clip.cpu().numpy().T
+                duration = audio_np.shape[0] / sr
+
+                fname = f"injected_{i}_{uuid.uuid4().hex[:6]}.wav"
+                fpath = os.path.join(temp_dir, fname)
+                sf.write(fpath, audio_np, sr)
+
+                scene["audio_path"] = fpath
+                scene["duration"] = duration
+            else:
+                pass
+
+        return (json.dumps(scenes, indent=2),)
+
+class OraclePostProduction:
+    @classmethod
+    def INPUT_TYPES(s):
+        from .utils import get_font_path
+        return {
+            "required": {
+                "enhanced_storyboard_json": ("STRING", {"forceInput": True}),
+                "font_size": ("INT", {"default": 60}),
+                "font_color": ("STRING", {"default": "#FFD700"}),
+                "stroke_width": ("INT", {"default": 4}),
+                "position_y": ("INT", {"default": 100}),
+                "preview_mode": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "video_paths": ("LIST",),
+                "preview_background": ("IMAGE",),
+                "font_path": ("STRING", {"default": get_font_path()}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("final_video", "preview_image")
+    FUNCTION = "process"
+    CATEGORY = "🪬 OracleMotion"
+    OUTPUT_NODE = True
+
+    def process(self, enhanced_storyboard_json, font_size, font_color, stroke_width, position_y, preview_mode, video_paths=None, preview_background=None, font_path=None):
+        scenes = json.loads(enhanced_storyboard_json)
+
+        # Setup Font
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except:
+            font = ImageFont.load_default()
+
+        def get_text_size(draw, text, font):
+            # Pillow 10+ Compatible
+            try:
+                left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+                return right - left, bottom - top
+            except:
+                # Fallback
+                return font.getsize(text)
+
+        # --- PREVIEW ---
+        if preview_mode:
+            # Create Canvas
+            W, H = 1080, 1920
+            if preview_background is not None:
+                # Comfy [1, H, W, 3]
+                i = 255. * preview_background[0].cpu().numpy()
+                img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8)).convert("RGB")
+                W, H = img.size
+            else:
+                img = Image.new("RGB", (W, H), (0, 0, 0))
+
+            draw = ImageDraw.Draw(img)
+
+            # Find Text
+            text = "SAMPLE CAPTION"
+            for s in scenes:
+                if s.get("dialogue"):
+                    text = s.get("dialogue")
+                    break
+
+            tw, th = get_text_size(draw, text, font)
+            x = (W - tw) / 2
+            y = H - position_y - th
+
+            draw.text((x, y), text, font=font, fill=font_color, stroke_width=stroke_width, stroke_fill="black")
+
+            res = torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+            return ("", res)
+
+        # --- RENDER ---
+        from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
+
+        clips = []
+        for i, path in enumerate(video_paths):
+            if os.path.exists(path):
+                clip = VideoFileClip(path)
+                if i < len(scenes):
+                    apath = scenes[i].get("audio_path")
+                    if apath and os.path.exists(apath):
+                        aclip = AudioFileClip(apath)
+                        clip = clip.set_audio(aclip)
+                        if abs(clip.duration - aclip.duration) > 0.5:
+                            clip = clip.set_duration(aclip.duration)
+                clips.append(clip)
+
+        if not clips: return ("", torch.zeros((1,512,512,3)))
+
+        final = concatenate_videoclips(clips, method="compose")
+
+        # Prepare Captions
+        captions = []
+        curr = 0
+        for i, c in enumerate(clips):
+            txt = scenes[i].get("dialogue", "")
+            if txt:
+                captions.append({"start": curr, "end": curr+c.duration, "text": txt})
+            curr += c.duration
+
+        def burn(get_frame, t):
+            frame = get_frame(t)
+            active = None
+            for c in captions:
+                if c["start"] <= t < c["end"]:
+                    active = c["text"]
+                    break
+
+            if active:
+                img = Image.fromarray(frame)
+                draw = ImageDraw.Draw(img)
+                W, H = img.size
+                tw, th = get_text_size(draw, active, font)
+                x = (W - tw) / 2
+                y = H - position_y - th
+                draw.text((x, y), active, font=font, fill=font_color, stroke_width=stroke_width, stroke_fill="black")
+                return np.array(img)
+            return frame
+
+        final_burned = final.fl(burn)
+
+        out_name = f"viral_{uuid.uuid4().hex[:6]}.mp4"
+        out_path = os.path.join(get_temp_dir(), out_name)
+
+        final_burned.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac", temp_audiofile="temp-audio.m4a", remove_temp=True)
+
+        final.close()
+        for c in clips: c.close()
+
+        return (out_path, torch.zeros((1,512,512,3)))

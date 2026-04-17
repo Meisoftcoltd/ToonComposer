@@ -418,10 +418,38 @@ def create_blank_mask(canvas_width=832, canvas_height=480):
     return Image.new('RGB', (canvas_width, canvas_height), color='white')
 
 def create_mask_with_sketch(sketch, canvas_width=832, canvas_height=480):
-    """Create a mask image with sketch as background"""
+    """Create a mask image with sketch as background or process drawn mask"""
     if sketch is None:
         return create_blank_mask(canvas_width, canvas_height)
         
+    if isinstance(sketch, dict) and 'layers' in sketch:
+        if not sketch['layers']:
+            return create_blank_mask(canvas_width, canvas_height)
+
+        mask = sketch['layers'][0]
+        if not isinstance(mask, Image.Image):
+            mask = Image.fromarray(np.array(mask))
+
+        # Invert mask: Black -> White, Transparent -> Black
+        mask = mask.convert('RGBA')
+        mask_data = np.array(mask)
+
+        # Pixels with alpha > 0 and are relatively dark (black) become white
+        # Transparent pixels become black
+        rgb = mask_data[:, :, :3]
+        alpha = mask_data[:, :, 3]
+
+        # Define 'black' as anything with all RGB channels < 128
+        is_black = np.all(rgb < 128, axis=-1)
+        is_not_transparent = alpha > 0
+
+        mask_pixels = is_black & is_not_transparent
+
+        new_mask = np.zeros((mask_data.shape[0], mask_data.shape[1], 3), dtype=np.uint8)
+        new_mask[mask_pixels] = [255, 255, 255]
+
+        return Image.fromarray(new_mask).resize((canvas_width, canvas_height))
+
     # Convert sketch to PIL if needed
     if not isinstance(sketch, Image.Image):
         sketch = Image.fromarray(np.array(sketch))

@@ -366,14 +366,8 @@ def process_sketch_masks(num_sketch_masks, sketch_mask_inputs, num_frames, targe
                     frame_idx = min(max(int(frame_idx), 0), num_frames-1)
                     sketch_local_mask[:, :, frame_idx] = mask_tensor
                     
-    sketch_mask_vis = torch.ones((1, 3, num_frames, target_height, target_width), device=device)
-    for t in range(sketch_local_mask.shape[2]):
-        for c in range(3):
-            sketch_mask_vis[0, c, t, :, :] = torch.where(
-                sketch_local_mask[0, 0, t] > 0.5,
-                1.0,  # White for unmasked areas
-                -1.0  # Black for masked areas
-            )
+    # Create visualization for the mask (1.0 for unmasked, -1.0 for masked)
+    sketch_mask_vis = torch.where(sketch_local_mask > 0.5, 1.0, -1.0).repeat(1, 3, 1, 1, 1)
     return sketch_local_mask
 
 

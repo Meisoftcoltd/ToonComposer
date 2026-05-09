@@ -253,6 +253,8 @@ def _parse_args():
     parser.add_argument("--tooncomposer_dir", type=str, default=os.environ.get("TOONCOMPOSER_DIR"), help="Local directory containing ToonComposer weights with 480p/608p subdirectories. If not provided, will try HF cache and download if needed.")
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN"), help="Hugging Face token (if needed for gated models).")
     parser.add_argument("--fast_dev", action="store_true", help="Run in fast dev mode without loading heavy models.")
+    parser.add_argument("--server_name", type=str, default=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"), help="Gradio server name.")
+    parser.add_argument("--server_port", type=int, default=int(os.environ.get("GRADIO_SERVER_PORT", 7860)), help="Gradio server port.")
     return parser.parse_args()
 
 _cli_args = _parse_args()
@@ -1076,6 +1078,6 @@ if __name__ == "__main__":
             inputs.append(sketch_input)
             inputs.append(frame_index_input)
             
-        iface.launch(server_port=7860, server_name="0.0.0.0",
+        iface.launch(server_port=_cli_args.server_port, server_name=_cli_args.server_name,
                      allowed_paths=[os.path.abspath(os.path.join(os.path.dirname(__file__), "gradio_cache")), 
                                    os.path.abspath(os.path.join(os.path.dirname(__file__), "samples"))])
